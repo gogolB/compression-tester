@@ -38,6 +38,12 @@ Commands:
   vote [I]      Cross-core voting screen: all cores run identical input,
                 majority rules on compressed digests (default 100 rounds).
                 Writes a digest log for offline verification.
+  iopath [I]    Kernel-path test: blobs round-trip through tmpfs page cache,
+                mirroring docker pull's actual data path (default 100 iters)
+  burst [I]     Burst mode: 50ms idle gaps between iterations to trigger
+                boost-clock/power-transition faults (default 200 iters)
+  topology      Print logical CPU -> socket/physical core mapping
+                (reconcile with vendor/RMA core numbering)
 
   sequential    Sequential only (one core at a time, identifies bad core)
   parallel      Parallel only (all cores at once, finds errors under load)
@@ -82,6 +88,9 @@ case "${1:-help}" in
     kat)      "$BIN" -m both -i "${2:-100}" -a all -k ;;
     vote)     "$BIN" -m parallel -V -i "${2:-100}" -a all \
                 --digest-log "$DIR/vote_$(date +%Y%m%d_%H%M%S).log" ;;
+    iopath)   "$BIN" -m both -i "${2:-100}" -a all -I ;;
+    burst)    "$BIN" -m both -i "${2:-200}" -a all -b 50 ;;
+    topology) "$BIN" -T ;;
     sequential) "$BIN" -m sequential -i 100 -a all -v ;;
     parallel) "$BIN" -m parallel -i 100 -a all -v ;;
     core)

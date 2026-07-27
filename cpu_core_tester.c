@@ -8,6 +8,8 @@
 #include <errno.h>
 #include <time.h>
 #include <signal.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #include <zlib.h>
 #include <zstd.h>
@@ -73,6 +75,16 @@ typedef enum {
 } run_mode_t;
 
 typedef struct {
+    int iterations;
+    size_t data_size;
+    algorithm_t algorithm;
+    int verbose;
+    int kat;
+    int iopath;              /* route blobs through the kernel (tmpfs), like docker */
+    int burst_ms;            /* idle gap between iterations; 0 = continuous */
+} run_opts_t;
+
+typedef struct {
     int core_id;
     int iterations;
     size_t data_size;
@@ -82,9 +94,14 @@ typedef struct {
     pthread_mutex_t *print_mutex;
     int verbose;
     int kat;
+    int iopath;
+    int burst_ms;
     int vote;
     uint8_t *vote_digests;     /* per-core buffer: iterations*alg_count digests, or NULL */
 } worker_args_t;
+
+/* Writable tmpfs directory for --iopath, picked at startup. */
+static const char *g_iopath_dir = "/dev/shm";
 
 static volatile int g_shutdown = 0;
 
@@ -392,6 +409,150 @@ static int test_lz4(const uint8_t *data, size_t data_size,
     return result;
 }
 
+/*
+ * Kernel I/O path (--iopath).
+ *
+ * A docker pull does not decompress in a userspace vacuum: the layer blob
+ * travels NIC -> kernel network stack -> page cache -> copy_to_user into
+ * dockerd -> decompress -> copy_from_user -> overlayfs. A core with a
+ * marginal cache/memory-movement path can corrupt data while executing
+ * KERNEL copy code and still pass every pinned userspace test. This path
+ * therefore pushes every blob through a tmpfs file (write + read back,
+ * i.e. copy_from_user + copy_to_user + page cache) on the pinned core,
+ * mirroring docker's actual data path without involving a disk.
+ */
+
+static size_t iopath_compress(algorithm_t alg, uint8_t *dst, size_t cap,
+                               const uint8_t *src, size_t n) {
+    switch (alg) {
+        case ALG_ZSTD: {
+            size_t r = ZSTD_compress(dst, cap, src, n, ZSTD_COMPRESSION_LEVEL);
+            return ZSTD_isError(r) ? 0 : r;
+        }
+        case ALG_LZ4:
+            return (size_t)LZ4_compress_default((const char *)src, (char *)dst, n, cap);
+        case ALG_ZLIB: {
+            uLongf blen = cap;
+            return compress2(dst, &blen, src, n, Z_DEFAULT_COMPRESSION) == Z_OK ? blen : 0;
+        }
+        default:
+            return 0;
+    }
+}
+
+static size_t iopath_decompress(algorithm_t alg, uint8_t *dst, size_t cap,
+                                 const uint8_t *src, size_t n) {
+    switch (alg) {
+        case ALG_ZSTD: {
+            size_t r = ZSTD_decompress(dst, cap, src, n);
+            return ZSTD_isError(r) ? 0 : r;
+        }
+        case ALG_LZ4: {
+            int r = LZ4_decompress_safe((const char *)src, (char *)dst, n, cap);
+            return r < 0 ? 0 : (size_t)r;
+        }
+        case ALG_ZLIB: {
+            uLongf blen = cap;
+            return uncompress(dst, &blen, src, n) == Z_OK ? blen : 0;
+        }
+        default:
+            return 0;
+    }
+}
+
+/*
+ * Write a buffer to a tmpfs file and read it back. Returns the number of
+ * bytes read back, or (size_t)-1 on error.
+ */
+static size_t kernel_roundtrip(const uint8_t *in, size_t size, uint8_t *out, int core_id) {
+    char path[128];
+    snprintf(path, sizeof(path), "%s/cct_%ld_%d", g_iopath_dir, (long)getpid(), core_id);
+
+    int fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    if (fd < 0)
+        return (size_t)-1;
+
+    size_t off = 0;
+    while (off < size) {
+        ssize_t w = write(fd, in + off, size - off);
+        if (w <= 0) { close(fd); unlink(path); return (size_t)-1; }
+        off += (size_t)w;
+    }
+    if (lseek(fd, 0, SEEK_SET) < 0) { close(fd); unlink(path); return (size_t)-1; }
+    off = 0;
+    while (off < size) {
+        ssize_t r = read(fd, out + off, size - off);
+        if (r <= 0) { close(fd); unlink(path); return (size_t)-1; }
+        off += (size_t)r;
+    }
+
+    close(fd);
+    unlink(path);
+    return off;
+}
+
+/*
+ * Compress -> kernel round-trip (tmpfs write + read back) -> blob compare
+ * -> decompress -> verify. The blob compare is the direct analog of
+ * docker's compressed-layer digest check.
+ */
+static int test_iopath(algorithm_t alg, const uint8_t *data, size_t data_size,
+                        const uint8_t expected_hash[SHA256_DIGEST_LENGTH],
+                        uint8_t *comp_digest, int core_id) {
+    /* ZSTD's bound is the largest of the three libraries' bounds. */
+    size_t bound = ZSTD_compressBound(data_size);
+    uint8_t *comp = malloc(bound);
+    uint8_t *comp_back = malloc(bound);
+    uint8_t *decomp = guarded_malloc(data_size);
+    if (!comp || !comp_back || !decomp) {
+        free(comp); free(comp_back); guarded_free(decomp);
+        return -1;
+    }
+
+    size_t comp_size = iopath_compress(alg, comp, bound, data, data_size);
+    if (comp_size == 0 ||
+        kernel_roundtrip(comp, comp_size, comp_back, core_id) != comp_size ||
+        memcmp(comp, comp_back, comp_size) != 0) {
+        free(comp); free(comp_back); guarded_free(decomp);
+        return -1;
+    }
+
+    if (comp_digest)
+        SHA256(comp_back, comp_size, comp_digest);
+
+    size_t decomp_size = iopath_decompress(alg, decomp, data_size, comp_back, comp_size);
+
+    int result = 0;
+    if (decomp_size != data_size) {
+        result = -1;
+    } else {
+        result = verify_output(data, decomp, data_size, expected_hash);
+    }
+    if (guard_check(decomp, data_size) != 0)
+        result = -1;
+
+    free(comp);
+    free(comp_back);
+    guarded_free(decomp);
+    return result;
+}
+
+/* Find a writable tmpfs for --iopath, or NULL. */
+static const char *pick_iopath_dir(void) {
+    static const char *candidates[] = { "/dev/shm", "/tmp", NULL };
+    for (int i = 0; candidates[i]; i++) {
+        char probe[128];
+        snprintf(probe, sizeof(probe), "%s/cct_probe_%ld", candidates[i], (long)getpid());
+        int fd = open(probe, O_CREAT | O_WRONLY | O_EXCL, 0600);
+        if (fd >= 0) {
+            close(fd);
+            unlink(probe);
+            return candidates[i];
+        }
+    }
+    return NULL;
+}
+
 static const char *alg_name(algorithm_t alg) {
     switch (alg) {
         case ALG_ZLIB: return "zlib";
@@ -483,7 +644,11 @@ static void *worker_thread(void *arg) {
             if (args->vote_digests)
                 slot = args->vote_digests +
                        ((size_t)iter * alg_count + a) * SHA256_DIGEST_LENGTH;
-            if (run_algorithm(algorithms[a], data, args->data_size, expected, slot) != 0) {
+            int rc = args->iopath
+                ? test_iopath(algorithms[a], data, args->data_size, expected, slot,
+                              args->core_id)
+                : run_algorithm(algorithms[a], data, args->data_size, expected, slot);
+            if (rc != 0) {
                 core_errors++;
                 pthread_mutex_lock(args->print_mutex);
                 printf("[CORE %2d] CORRUPTION iter=%d algorithm=%s\n",
@@ -506,6 +671,12 @@ static void *worker_thread(void *arg) {
                    args->core_id, iter + 1, args->iterations, core_errors);
             pthread_mutex_unlock(args->print_mutex);
         }
+
+        /* Burst mode: let the core drop to idle so the next iteration
+         * ramps clocks again. Marginal silicon often faults during
+         * boost/power-state transitions, not under steady load. */
+        if (args->burst_ms > 0 && !g_shutdown)
+            usleep((useconds_t)args->burst_ms * 1000);
     }
 
     __sync_fetch_and_add(args->error_count, core_errors);
@@ -514,10 +685,55 @@ static void *worker_thread(void *arg) {
     return NULL;
 }
 
+/*
+ * Read /sys topology for a logical CPU. Needed because vendor/RMA
+ * diagnostics use per-socket physical core ids (which repeat across
+ * sockets) while affinity uses logical CPU numbers - reconciling the two
+ * by hand on a multi-socket Xeon is exactly where attribution gets lost.
+ */
+static int read_topology(int cpu, int *package, int *pcore) {
+    char path[128];
+    FILE *f;
+
+    snprintf(path, sizeof(path),
+             "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu);
+    f = fopen(path, "r");
+    if (!f)
+        return -1;
+    if (fscanf(f, "%d", package) != 1) { fclose(f); return -1; }
+    fclose(f);
+
+    snprintf(path, sizeof(path),
+             "/sys/devices/system/cpu/cpu%d/topology/core_id", cpu);
+    f = fopen(path, "r");
+    if (!f)
+        return -1;
+    if (fscanf(f, "%d", pcore) != 1) { fclose(f); return -1; }
+    fclose(f);
+
+    return 0;
+}
+
+static void print_topology_map(int offset, int num_cores) {
+    printf("Logical CPU -> socket/physical-core mapping:\n");
+    for (int i = 0; i < num_cores; i++) {
+        int core = offset + i, pkg = -1, pc = -1;
+        if (read_topology(core, &pkg, &pc) == 0)
+            printf("  cpu %-4d socket %d, physical core %d\n", core, pkg, pc);
+        else
+            printf("  cpu %-4d (topology unavailable)\n", core);
+    }
+}
+
 static void print_core_list(const char *label, const int *cores, int count) {
     printf("%s", label);
-    for (int i = 0; i < count; i++)
-        printf("%d%s", cores[i], i < count - 1 ? ", " : "");
+    for (int i = 0; i < count; i++) {
+        int pkg = -1, pc = -1;
+        printf("%d", cores[i]);
+        if (read_topology(cores[i], &pkg, &pc) == 0)
+            printf("(s%d/c%d)", pkg, pc);
+        printf("%s", i < count - 1 ? ", " : "");
+    }
     printf("\n");
 }
 
@@ -525,11 +741,11 @@ static void print_core_list(const char *label, const int *cores, int count) {
  * Returns EXIT_* bitmask: bit 0 set if any core showed corruption,
  * bit 1 set if any core could not be tested at all.
  */
-static int run_sequential(int num_cores, int offset, int iterations, size_t data_size,
-                            algorithm_t algorithm, int verbose, int kat) {
+static int run_sequential(int num_cores, int offset, const run_opts_t *opts) {
     printf("\n=== SEQUENTIAL: one core at a time ===\n");
     printf("Cores: %d-%d | Iterations: %d | Block: %zu MB\n\n",
-           offset, offset + num_cores - 1, iterations, data_size / (1024 * 1024));
+           offset, offset + num_cores - 1, opts->iterations,
+           opts->data_size / (1024 * 1024));
 
     int total_errors = 0;
     int bad_cores[MAX_CORES];
@@ -548,14 +764,16 @@ static int run_sequential(int num_cores, int offset, int iterations, size_t data
 
         worker_args_t args = {
             .core_id = core,
-            .iterations = iterations,
-            .data_size = data_size,
-            .algorithm = algorithm,
+            .iterations = opts->iterations,
+            .data_size = opts->data_size,
+            .algorithm = opts->algorithm,
             .error_count = &error_count,
             .tested = &tested,
             .print_mutex = &print_mutex,
-            .verbose = verbose,
-            .kat = kat,
+            .verbose = opts->verbose,
+            .kat = opts->kat,
+            .iopath = opts->iopath,
+            .burst_ms = opts->burst_ms,
         };
 
         pthread_t thread;
@@ -599,11 +817,11 @@ static int run_sequential(int num_cores, int offset, int iterations, size_t data
 /*
  * Returns EXIT_* bitmask, same as run_sequential.
  */
-static int run_parallel(int num_cores, int offset, int iterations, size_t data_size,
-                          algorithm_t algorithm, int verbose, int kat) {
+static int run_parallel(int num_cores, int offset, const run_opts_t *opts) {
     printf("\n=== PARALLEL: all cores at once ===\n");
     printf("Cores: %d-%d | Iterations: %d | Block: %zu MB\n\n",
-           offset, offset + num_cores - 1, iterations, data_size / (1024 * 1024));
+           offset, offset + num_cores - 1, opts->iterations,
+           opts->data_size / (1024 * 1024));
 
     int errors[MAX_CORES] = {0};
     int tested[MAX_CORES] = {0};
@@ -617,14 +835,16 @@ static int run_parallel(int num_cores, int offset, int iterations, size_t data_s
         int core = offset + i;
         args[i] = (worker_args_t){
             .core_id = core,
-            .iterations = iterations,
-            .data_size = data_size,
-            .algorithm = algorithm,
+            .iterations = opts->iterations,
+            .data_size = opts->data_size,
+            .algorithm = opts->algorithm,
             .error_count = &errors[i],
             .tested = &tested[i],
             .print_mutex = &print_mutex,
-            .verbose = verbose,
-            .kat = kat,
+            .verbose = opts->verbose,
+            .kat = opts->kat,
+            .iopath = opts->iopath,
+            .burst_ms = opts->burst_ms,
         };
         int rc = pthread_create(&threads[i], NULL, worker_thread, &args[i]);
         if (rc != 0) {
@@ -695,16 +915,16 @@ static void fprint_digest_hex(FILE *f, const uint8_t *d) {
         fprintf(f, "%02x", d[i]);
 }
 
-static int run_vote(int num_cores, int offset, int iterations, size_t data_size,
-                     algorithm_t algorithm, int verbose, int kat,
+static int run_vote(int num_cores, int offset, const run_opts_t *opts,
                      const char *digest_log) {
     printf("\n=== VOTE: all cores, identical input, majority rules ===\n");
     printf("Cores: %d-%d | Rounds: %d | Block: %zu MB\n\n",
-           offset, offset + num_cores - 1, iterations, data_size / (1024 * 1024));
+           offset, offset + num_cores - 1, opts->iterations,
+           opts->data_size / (1024 * 1024));
 
     algorithm_t algorithms[NUM_ALGORITHMS];
-    int alg_count = resolve_algorithms(algorithm, algorithms);
-    size_t rounds = (size_t)iterations * alg_count;
+    int alg_count = resolve_algorithms(opts->algorithm, algorithms);
+    size_t rounds = (size_t)opts->iterations * alg_count;
 
     int errors[MAX_CORES] = {0};
     int tested[MAX_CORES] = {0};
@@ -724,14 +944,16 @@ static int run_vote(int num_cores, int offset, int iterations, size_t data_size,
         int core = offset + i;
         args[i] = (worker_args_t){
             .core_id = core,
-            .iterations = iterations,
-            .data_size = data_size,
-            .algorithm = algorithm,
+            .iterations = opts->iterations,
+            .data_size = opts->data_size,
+            .algorithm = opts->algorithm,
             .error_count = &errors[i],
             .tested = &tested[i],
             .print_mutex = &print_mutex,
-            .verbose = verbose,
-            .kat = kat,
+            .verbose = opts->verbose,
+            .kat = opts->kat,
+            .iopath = opts->iopath,
+            .burst_ms = opts->burst_ms,
             .vote = 1,
             .vote_digests = all_digests + (size_t)i * rounds * SHA256_DIGEST_LENGTH,
         };
@@ -761,7 +983,7 @@ static int run_vote(int num_cores, int offset, int iterations, size_t data_size,
                 if (!tested[i])
                     continue;
                 const uint8_t *d = all_digests + (size_t)i * rounds * SHA256_DIGEST_LENGTH;
-                for (int iter = 0; iter < iterations; iter++) {
+                for (int iter = 0; iter < opts->iterations; iter++) {
                     for (int a = 0; a < alg_count; a++) {
                         fprintf(f, "core=%d iter=%d alg=%s digest=",
                                 offset + i, iter, alg_name(algorithms[a]));
@@ -877,6 +1099,11 @@ static void print_usage(const char *prog) {
     printf("  -k, --kat            Known-answer test: verify against golden digests\n");
     printf("                       precomputed on a trusted machine (block: %d MB)\n",
            KAT_BLOCK_MB);
+    printf("  -I, --iopath         Route blobs through the kernel (tmpfs write+read),\n");
+    printf("                       mirroring docker's page-cache data path\n");
+    printf("  -b, --burst MS       Sleep MS ms between iterations: idle<->boost\n");
+    printf("                       transitions trigger marginal silicon (0 = off)\n");
+    printf("  -T, --topology       Print logical CPU -> socket/physical-core map, exit\n");
     printf("  -v, --verbose        Show progress\n");
     printf("  -h, --help           Help\n");
     printf("\nExit code: 0 = all tested cores clean, 1 = bad cores found,\n");
@@ -899,6 +1126,9 @@ int main(int argc, char **argv) {
     int kat = 0;
     int size_set = 0;
     int vote = 0;
+    int iopath = 0;
+    int burst_ms = 0;
+    int topology = 0;
     const char *digest_log = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -936,6 +1166,12 @@ int main(int argc, char **argv) {
             vote = 1;
         } else if (strcmp(argv[i], "--digest-log") == 0 && i+1 < argc) {
             digest_log = argv[++i];
+        } else if (strcmp(argv[i], "-I") == 0 || strcmp(argv[i], "--iopath") == 0) {
+            iopath = 1;
+        } else if ((strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--burst") == 0) && i+1 < argc)
+            burst_ms = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-T") == 0 || strcmp(argv[i], "--topology") == 0) {
+            topology = 1;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -952,6 +1188,19 @@ int main(int argc, char **argv) {
         if (size_set)
             printf("NOTE: --kat uses fixed %d MB vectors; ignoring --size\n", KAT_BLOCK_MB);
         data_size = KAT_BLOCK_BYTES;
+    }
+    if (burst_ms < 0)
+        burst_ms = 0;
+    if (iopath) {
+        g_iopath_dir = pick_iopath_dir();
+        if (!g_iopath_dir) {
+            fprintf(stderr, "--iopath: no writable tmpfs found (tried /dev/shm, /tmp)\n");
+            return 1;
+        }
+    }
+    if (topology) {
+        print_topology_map(offset, num_cores);
+        return 0;
     }
 
     signal(SIGINT, signal_handler);
@@ -975,18 +1224,29 @@ int main(int argc, char **argv) {
     if (kat)
         printf("KAT:        %d golden vectors (digests from trusted machine)\n",
                KAT_VECTOR_COUNT);
+    if (iopath)
+        printf("IO path:    kernel round-trip via %s (docker blob path)\n", g_iopath_dir);
+    if (burst_ms > 0)
+        printf("Burst:      %d ms idle between iterations\n", burst_ms);
+
+    run_opts_t opts = {
+        .iterations = iterations,
+        .data_size = data_size,
+        .algorithm = algorithm,
+        .verbose = verbose,
+        .kat = kat,
+        .iopath = iopath,
+        .burst_ms = burst_ms,
+    };
 
     int result = EXIT_CLEAN;
     if (mode == MODE_SEQUENTIAL || mode == MODE_BOTH)
-        result |= run_sequential(num_cores, offset, iterations, data_size, algorithm,
-                                 verbose, kat);
+        result |= run_sequential(num_cores, offset, &opts);
     if (mode == MODE_PARALLEL || mode == MODE_BOTH) {
         if (vote)
-            result |= run_vote(num_cores, offset, iterations, data_size, algorithm,
-                               verbose, kat, digest_log);
+            result |= run_vote(num_cores, offset, &opts, digest_log);
         else
-            result |= run_parallel(num_cores, offset, iterations, data_size, algorithm,
-                                   verbose, kat);
+            result |= run_parallel(num_cores, offset, &opts);
     }
 
     if (result & EXIT_UNTESTED)
