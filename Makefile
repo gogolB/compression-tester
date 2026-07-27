@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -O2 -Wall -Wextra -pthread
-LDFLAGS = -lz -lzstd -lz4 -lssl -lcrypto
+LDFLAGS = -lz -lzstd -llz4 -lssl -lcrypto
 
 TARGET = cpu_core_tester
 SRC = cpu_core_tester.c
