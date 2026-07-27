@@ -74,14 +74,11 @@ case "${1:-help}" in
     parallel) sudo "$BIN" -m parallel -i 100 -a all -v ;;
     core)
         [ -z "$2" ] && { echo "Usage: $0 core <N> [iterations]"; exit 1; }
-        sudo "$BIN" -m sequential -c 1 -i "${3:-100}" -a all -v
-        echo ""
-        echo "NOTE: Above tests CPU 0 only. To pin to core $2:"
-        echo "  taskset -c $2 $BIN -m sequential -c 1 -i ${3:-100} -a all -v"
+        sudo "$BIN" -m sequential -c 1 -o "$2" -i "${3:-100}" -a all -v
         ;;
     core-soak)
         [ -z "$2" ] && { echo "Usage: $0 core-soak <N> [iterations]"; exit 1; }
-        sudo "$BIN" -m sequential -c 1 -i "${3:-1000}" -a all -v
+        sudo "$BIN" -m sequential -c 1 -o "$2" -i "${3:-1000}" -a all -v
         ;;
     help|-h|--help) usage ;;
     *) echo "Unknown command: $1"; usage; exit 1 ;;

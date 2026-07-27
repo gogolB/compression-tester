@@ -18,6 +18,11 @@
 #define DEFAULT_ITERATIONS 100
 #define MAX_CORES 1024
 
+/* Exit codes: bit 0 = bad cores found, bit 1 = some cores untested */
+#define EXIT_CLEAN     0
+#define EXIT_BAD_CORES 1
+#define EXIT_UNTESTED  2
+
 typedef enum {
     ALG_ZLIB,
     ALG_ZSTD,
@@ -36,8 +41,8 @@ typedef struct {
     int iterations;
     size_t data_size;
     algorithm_t algorithm;
-    volatile int *error_count;
-    volatile int *completed;
+    int *error_count;        /* per-core slot, written only by this worker */
+    int *tested;             /* per-core slot: set to 1 only if the workload ran */
     pthread_mutex_t *print_mutex;
     int verbose;
 } worker_args_t;
@@ -53,37 +58,41 @@ static void signal_handler(int sig) {
  * Generate varied data patterns that exercise different parts of the CPU.
  * Docker layers contain a mix of: zeros, repeated bytes, random data,
  * text-like sequences, and compressed-already data.
+ *
+ * The seed makes every iteration use a different buffer: marginal cores
+ * usually fail only on specific data patterns, so identical input every
+ * iteration drastically reduces the chance of catching them.
  */
-static void fill_layer_data(uint8_t *buf, size_t size) {
+static void fill_layer_data(uint8_t *buf, size_t size, uint64_t seed) {
     size_t pos = 0;
-    uint64_t seed = 0xDEADBEEFCAFEBABEULL;
+    uint64_t rng = seed ? seed : 0xDEADBEEFCAFEBABEULL;
 
     while (pos < size) {
         size_t chunk = (size - pos > 4096) ? 4096 : size - pos;
 
-        uint8_t pattern = (uint8_t)((pos / 4096) % 5);
+        uint8_t pattern = (uint8_t)(((pos / 4096) + seed) % 5);
         switch (pattern) {
             case 0:
                 memset(buf + pos, 0, chunk);
                 break;
             case 1:
-                memset(buf + pos, 0xAA, chunk);
+                memset(buf + pos, (int)(seed & 0xFF), chunk);
                 break;
             case 2:
                 for (size_t i = 0; i < chunk; i++)
-                    buf[pos + i] = (uint8_t)(i & 0xFF);
+                    buf[pos + i] = (uint8_t)((i + seed) & 0xFF);
                 break;
             case 3:
                 for (size_t i = 0; i < chunk; i++) {
-                    seed ^= seed >> 12;
-                    seed ^= seed << 25;
-                    seed ^= seed >> 27;
-                    buf[pos + i] = (uint8_t)(seed & 0xFF);
+                    rng ^= rng >> 12;
+                    rng ^= rng << 25;
+                    rng ^= rng >> 27;
+                    buf[pos + i] = (uint8_t)(rng & 0xFF);
                 }
                 break;
             case 4:
                 for (size_t i = 0; i < chunk; i++)
-                    buf[pos + i] = (uint8_t)('A' + (i % 26));
+                    buf[pos + i] = (uint8_t)('A' + ((i + seed) % 26));
                 break;
         }
         pos += chunk;
@@ -101,13 +110,25 @@ static int sha256_verify(const uint8_t *data, size_t len, const uint8_t expected
 }
 
 /*
- * Compress -> decompress -> SHA256 verify.
+ * Verify the round-trip output. memcmp is the deterministic check; SHA256
+ * mirrors the Docker digest verification on top of it.
+ */
+static int verify_output(const uint8_t *original, const uint8_t *decompressed,
+                          size_t data_size, const uint8_t expected_hash[32]) {
+    if (memcmp(decompressed, original, data_size) != 0)
+        return -1;
+    return sha256_verify(decompressed, data_size, expected_hash);
+}
+
+/*
+ * Compress -> decompress -> verify.
  * Mirrors the Docker pull pipeline for a single layer chunk.
  * Returns 0 if the round-trip produces identical, hash-verified output.
  */
 static int test_zlib(const uint8_t *data, size_t data_size,
                       const uint8_t expected_hash[32]) {
-    Bytef *compressed = malloc(ZSTD_compressBound(data_size));
+    uLong comp_bound = compressBound(data_size);
+    Bytef *compressed = malloc(comp_bound);
     Bytef *decompressed = malloc(data_size);
     if (!compressed || !decompressed) {
         free(compressed); free(decompressed);
@@ -122,7 +143,7 @@ static int test_zlib(const uint8_t *data, size_t data_size,
     c_stream.next_in = (Bytef *)data;
     c_stream.avail_in = data_size;
     c_stream.next_out = compressed;
-    c_stream.avail_out = ZSTD_compressBound(data_size);
+    c_stream.avail_out = comp_bound;
 
     if (deflate(&c_stream, Z_FINISH) != Z_STREAM_END) {
         deflateEnd(&c_stream);
@@ -154,7 +175,7 @@ static int test_zlib(const uint8_t *data, size_t data_size,
     if (decomp_size != data_size) {
         result = -1;
     } else {
-        result = sha256_verify(decompressed, data_size, expected_hash);
+        result = verify_output(data, decompressed, data_size, expected_hash);
     }
 
     free(compressed);
@@ -188,7 +209,7 @@ static int test_zstd(const uint8_t *data, size_t data_size,
     if (decomp_size != data_size) {
         result = -1;
     } else {
-        result = sha256_verify(decompressed, data_size, expected_hash);
+        result = verify_output(data, decompressed, data_size, expected_hash);
     }
 
     free(compressed);
@@ -207,7 +228,7 @@ static int test_lz4(const uint8_t *data, size_t data_size,
     }
 
     int comp_size = LZ4_compress_default((const char *)data, compressed,
-                                          data_size, comp_bound);
+                                           data_size, comp_bound);
     if (comp_size <= 0) {
         free(compressed); free(decompressed);
         return -1;
@@ -220,7 +241,7 @@ static int test_lz4(const uint8_t *data, size_t data_size,
     if (decomp_size != (int)data_size) {
         result = -1;
     } else {
-        result = sha256_verify((uint8_t *)decompressed, data_size, expected_hash);
+        result = verify_output(data, (uint8_t *)decompressed, data_size, expected_hash);
     }
 
     free(compressed);
@@ -254,9 +275,12 @@ static void *worker_thread(void *arg) {
     CPU_ZERO(&cpuset);
     CPU_SET(args->core_id, &cpuset);
 
-    if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) {
+    /* pthread functions return the error code directly, not via errno */
+    int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    if (rc != 0) {
         pthread_mutex_lock(args->print_mutex);
-        fprintf(stderr, "[CORE %2d] ERROR: Failed to set affinity\n", args->core_id);
+        fprintf(stderr, "[CORE %2d] ERROR: cannot set affinity: %s (core NOT tested)\n",
+                args->core_id, strerror(rc));
         pthread_mutex_unlock(args->print_mutex);
         return NULL;
     }
@@ -264,15 +288,10 @@ static void *worker_thread(void *arg) {
     uint8_t *data = malloc(args->data_size);
     if (!data) {
         pthread_mutex_lock(args->print_mutex);
-        fprintf(stderr, "[CORE %2d] ERROR: malloc failed\n", args->core_id);
+        fprintf(stderr, "[CORE %2d] ERROR: malloc failed (core NOT tested)\n", args->core_id);
         pthread_mutex_unlock(args->print_mutex);
         return NULL;
     }
-
-    fill_layer_data(data, args->data_size);
-
-    uint8_t hash[SHA256_DIGEST_LENGTH];
-    SHA256(data, args->data_size, hash);
 
     algorithm_t algorithms[3];
     int alg_count = 0;
@@ -287,9 +306,19 @@ static void *worker_thread(void *arg) {
         alg_count = 1;
     }
 
+    /* Affinity and buffer are set up: the workload will actually run. */
+    __sync_fetch_and_add(args->tested, 1);
+
     int core_errors = 0;
+    uint64_t base_seed = 0x9E3779B97F4A7C15ULL * (uint64_t)(args->core_id + 1);
 
     for (int iter = 0; iter < args->iterations && !g_shutdown; iter++) {
+        /* Fresh data every iteration: different patterns, different paths. */
+        fill_layer_data(data, args->data_size, base_seed + (uint64_t)iter);
+
+        uint8_t hash[SHA256_DIGEST_LENGTH];
+        SHA256(data, args->data_size, hash);
+
         for (int a = 0; a < alg_count; a++) {
             if (run_algorithm(algorithms[a], data, args->data_size, hash) != 0) {
                 core_errors++;
@@ -309,28 +338,41 @@ static void *worker_thread(void *arg) {
     }
 
     __sync_fetch_and_add(args->error_count, core_errors);
-    __sync_fetch_and_add(args->completed, 1);
 
     free(data);
     return NULL;
 }
 
-static void run_sequential(int num_cores, int iterations, size_t data_size,
+static void print_core_list(const char *label, const int *cores, int count) {
+    printf("%s", label);
+    for (int i = 0; i < count; i++)
+        printf("%d%s", cores[i], i < count - 1 ? ", " : "");
+    printf("\n");
+}
+
+/*
+ * Returns EXIT_* bitmask: bit 0 set if any core showed corruption,
+ * bit 1 set if any core could not be tested at all.
+ */
+static int run_sequential(int num_cores, int offset, int iterations, size_t data_size,
                             algorithm_t algorithm, int verbose) {
     printf("\n=== SEQUENTIAL: one core at a time ===\n");
-    printf("Cores: %d | Iterations: %d | Block: %zu MB\n\n",
-           num_cores, iterations, data_size / (1024 * 1024));
+    printf("Cores: %d-%d | Iterations: %d | Block: %zu MB\n\n",
+           offset, offset + num_cores - 1, iterations, data_size / (1024 * 1024));
 
     int total_errors = 0;
-    int bad_cores[MAX_CORES] = {0};
+    int bad_cores[MAX_CORES];
     int bad_count = 0;
+    int skipped_cores[MAX_CORES];
+    int skip_count = 0;
 
-    for (int core = 0; core < num_cores && !g_shutdown; core++) {
+    for (int i = 0; i < num_cores && !g_shutdown; i++) {
+        int core = offset + i;
         printf("  core %2d ... ", core);
         fflush(stdout);
 
         int error_count = 0;
-        int completed = 0;
+        int tested = 0;
         pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
 
         worker_args_t args = {
@@ -339,19 +381,25 @@ static void run_sequential(int num_cores, int iterations, size_t data_size,
             .data_size = data_size,
             .algorithm = algorithm,
             .error_count = &error_count,
-            .completed = &completed,
+            .tested = &tested,
             .print_mutex = &print_mutex,
             .verbose = verbose,
         };
 
         pthread_t thread;
-        if (pthread_create(&thread, NULL, worker_thread, &args) != 0) {
-            printf("FAILED (thread)\n");
+        int rc = pthread_create(&thread, NULL, worker_thread, &args);
+        if (rc != 0) {
+            printf("NOT TESTED (pthread_create: %s)\n", strerror(rc));
+            skipped_cores[skip_count++] = core;
             continue;
         }
         pthread_join(thread, NULL);
 
-        if (error_count > 0) {
+        if (!tested) {
+            /* Worker never ran the workload: this is NOT a pass. */
+            printf("NOT TESTED\n");
+            skipped_cores[skip_count++] = core;
+        } else if (error_count > 0) {
             printf("FAIL (%d errors)\n", error_count);
             total_errors += error_count;
             bad_cores[bad_count++] = core;
@@ -362,50 +410,94 @@ static void run_sequential(int num_cores, int iterations, size_t data_size,
 
     printf("\n--- sequential results ---\n");
     if (bad_count > 0) {
-        printf("BAD CORES: ");
-        for (int i = 0; i < bad_count; i++)
-            printf("%d%s", bad_cores[i], i < bad_count - 1 ? ", " : "");
-        printf(" (%d total errors)\n", total_errors);
-    } else {
-        printf("ALL %d CORES CLEAN\n", num_cores);
+        print_core_list("BAD CORES: ", bad_cores, bad_count);
+        printf("(%d total errors)\n", total_errors);
     }
+    if (skip_count > 0)
+        print_core_list("UNTESTED CORES: ", skipped_cores, skip_count);
+    if (bad_count == 0 && skip_count == 0)
+        printf("ALL %d CORES CLEAN\n", num_cores);
+    else if (bad_count == 0)
+        printf("No corruption found, but %d core(s) were NOT tested - result is inconclusive\n",
+               skip_count);
+
+    return (bad_count > 0 ? EXIT_BAD_CORES : 0) | (skip_count > 0 ? EXIT_UNTESTED : 0);
 }
 
-static void run_parallel(int num_cores, int iterations, size_t data_size,
+/*
+ * Returns EXIT_* bitmask, same as run_sequential.
+ */
+static int run_parallel(int num_cores, int offset, int iterations, size_t data_size,
                           algorithm_t algorithm, int verbose) {
     printf("\n=== PARALLEL: all cores at once ===\n");
-    printf("Cores: %d | Iterations: %d | Block: %zu MB\n\n",
-           num_cores, iterations, data_size / (1024 * 1024));
+    printf("Cores: %d-%d | Iterations: %d | Block: %zu MB\n\n",
+           offset, offset + num_cores - 1, iterations, data_size / (1024 * 1024));
 
-    int error_count = 0;
-    int completed = 0;
+    int errors[MAX_CORES] = {0};
+    int tested[MAX_CORES] = {0};
+    int created[MAX_CORES] = {0};
     pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
 
     pthread_t threads[MAX_CORES];
     worker_args_t args[MAX_CORES];
 
-    for (int core = 0; core < num_cores; core++) {
-        args[core] = (worker_args_t){
+    for (int i = 0; i < num_cores; i++) {
+        int core = offset + i;
+        args[i] = (worker_args_t){
             .core_id = core,
             .iterations = iterations,
             .data_size = data_size,
             .algorithm = algorithm,
-            .error_count = &error_count,
-            .completed = &completed,
+            .error_count = &errors[i],
+            .tested = &tested[i],
             .print_mutex = &print_mutex,
             .verbose = verbose,
         };
-        pthread_create(&threads[core], NULL, worker_thread, &args[core]);
+        int rc = pthread_create(&threads[i], NULL, worker_thread, &args[i]);
+        if (rc != 0) {
+            pthread_mutex_lock(&print_mutex);
+            fprintf(stderr, "[CORE %2d] ERROR: pthread_create: %s (core NOT tested)\n",
+                    core, strerror(rc));
+            pthread_mutex_unlock(&print_mutex);
+        } else {
+            created[i] = 1;
+        }
     }
 
-    for (int core = 0; core < num_cores; core++)
-        pthread_join(threads[core], NULL);
+    for (int i = 0; i < num_cores; i++)
+        if (created[i])
+            pthread_join(threads[i], NULL);
+
+    int total_errors = 0;
+    int bad_cores[MAX_CORES];
+    int bad_count = 0;
+    int skipped_cores[MAX_CORES];
+    int skip_count = 0;
+
+    for (int i = 0; i < num_cores; i++) {
+        int core = offset + i;
+        if (!tested[i]) {
+            skipped_cores[skip_count++] = core;
+        } else if (errors[i] > 0) {
+            total_errors += errors[i];
+            bad_cores[bad_count++] = core;
+        }
+    }
 
     printf("\n--- parallel results ---\n");
-    if (error_count > 0)
-        printf("FAILED: %d total errors\n", error_count);
-    else
+    if (bad_count > 0) {
+        print_core_list("BAD CORES: ", bad_cores, bad_count);
+        printf("(%d total errors)\n", total_errors);
+    }
+    if (skip_count > 0)
+        print_core_list("UNTESTED CORES: ", skipped_cores, skip_count);
+    if (bad_count == 0 && skip_count == 0)
         printf("ALL %d CORES CLEAN\n", num_cores);
+    else if (bad_count == 0)
+        printf("No corruption found, but %d core(s) were NOT tested - result is inconclusive\n",
+               skip_count);
+
+    return (bad_count > 0 ? EXIT_BAD_CORES : 0) | (skip_count > 0 ? EXIT_UNTESTED : 0);
 }
 
 static void print_usage(const char *prog) {
@@ -415,12 +507,15 @@ static void print_usage(const char *prog) {
     printf("Mirrors the Docker image pull decompression + digest check.\n\n");
     printf("Options:\n");
     printf("  -c, --cores N        Cores to test (default: all)\n");
+    printf("  -o, --offset N       Start testing at core N (default: 0)\n");
     printf("  -i, --iterations N   Iterations per core (default: %d)\n", DEFAULT_ITERATIONS);
     printf("  -s, --size MB        Block size in MB (default: 16)\n");
     printf("  -a, --alg ALG        zlib | zstd | lz4 | all (default: all)\n");
     printf("  -m, --mode MODE      sequential | parallel | both (default: both)\n");
     printf("  -v, --verbose        Show progress\n");
     printf("  -h, --help           Help\n");
+    printf("\nExit code: 0 = all tested cores clean, 1 = bad cores found,\n");
+    printf("           2 = some cores untested, 3 = both\n");
 }
 
 static int get_num_cores(void) {
@@ -430,6 +525,7 @@ static int get_num_cores(void) {
 
 int main(int argc, char **argv) {
     int num_cores = -1;
+    int offset = 0;
     int iterations = DEFAULT_ITERATIONS;
     size_t data_size = 16 * 1024 * 1024;
     algorithm_t algorithm = ALG_ALL;
@@ -442,6 +538,8 @@ int main(int argc, char **argv) {
             return 0;
         } else if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--cores") == 0) && i+1 < argc)
             num_cores = atoi(argv[++i]);
+        else if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--offset") == 0) && i+1 < argc)
+            offset = atoi(argv[++i]);
         else if ((strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--iterations") == 0) && i+1 < argc)
             iterations = atoi(argv[++i]);
         else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--size") == 0) && i+1 < argc)
@@ -469,24 +567,39 @@ int main(int argc, char **argv) {
     }
 
     if (num_cores <= 0) num_cores = get_num_cores();
-    if (num_cores > MAX_CORES) num_cores = MAX_CORES;
+    if (offset < 0) offset = 0;
+    if (iterations < 1) iterations = 1;
+    if (offset + num_cores > MAX_CORES) num_cores = MAX_CORES - offset;
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
+    /* Line-buffer stdout so status lines and stderr ERROR lines interleave
+     * correctly when output is piped to a log file (e.g. overnight soak). */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     printf("Compression Pipeline Corruption Tester\n");
     printf("=======================================\n");
-    printf("Cores:      %d\n", num_cores);
+    printf("Cores:      %d", num_cores);
+    if (offset > 0)
+        printf(" (starting at core %d)", offset);
+    printf("\n");
     printf("Iterations: %d\n", iterations);
     printf("Block:      %zu MB\n", data_size / (1024 * 1024));
     printf("Algorithm:  %s\n", algorithm == ALG_ALL ? "zstd + lz4 + zlib" : alg_name(algorithm));
     printf("Mode:       %s\n", mode == MODE_SEQUENTIAL ? "sequential" :
                                 mode == MODE_PARALLEL ? "parallel" : "both");
 
+    int result = EXIT_CLEAN;
     if (mode == MODE_SEQUENTIAL || mode == MODE_BOTH)
-        run_sequential(num_cores, iterations, data_size, algorithm, verbose);
+        result |= run_sequential(num_cores, offset, iterations, data_size, algorithm, verbose);
     if (mode == MODE_PARALLEL || mode == MODE_BOTH)
-        run_parallel(num_cores, iterations, data_size, algorithm, verbose);
+        result |= run_parallel(num_cores, offset, iterations, data_size, algorithm, verbose);
 
-    return 0;
+    if (result & EXIT_UNTESTED)
+        printf("\nWARNING: some cores were not tested (offline? container cpuset? "
+               "insufficient memory?).\nA 'clean' result only covers the cores that "
+               "actually ran the workload.\n");
+
+    return result;
 }
