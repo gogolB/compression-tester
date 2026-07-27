@@ -1,6 +1,8 @@
 CC = gcc
 CFLAGS = -O2 -Wall -Wextra -pthread
 LDFLAGS = -lz -lzstd -llz4 -lssl -lcrypto
+# Static link needs libdl for libcrypto on glibc.
+LDFLAGS_STATIC = -lz -lzstd -llz4 -lcrypto -ldl
 
 TARGET = cpu_core_tester
 SRC = cpu_core_tester.c
@@ -13,7 +15,22 @@ $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) kat_dump
+
+# Regenerate golden KAT digests. ONLY run this on a TRUSTED machine,
+# then paste the printed table into cpu_core_tester.c.
+kat-dump: kat_dump.c $(SRC)
+	$(CC) $(CFLAGS) -o kat_dump kat_dump.c $(LDFLAGS)
+
+# Build a self-contained static binary on a TRUSTED machine, copy it to
+# the suspect host, and verify the printed SHA256 there before running.
+# Do NOT build on the suspect host: the compiler itself would run on
+# possibly-failing cores and could emit a corrupted binary.
+# NOTE: flags are intentionally generic (-O2, no -march=native) so the
+# binary runs on any x86-64, whatever class the Xeon is.
+static: $(SRC)
+	$(CC) $(CFLAGS) -static -o $(TARGET) $< $(LDFLAGS_STATIC)
+	sha256sum $(TARGET)
 
 deps:
 	@echo "Installing dependencies (Debian/Ubuntu)..."

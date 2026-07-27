@@ -6,6 +6,10 @@ BIN="$DIR/cpu_core_tester"
 
 if [ ! -f "$BIN" ]; then
     echo "Building..."
+    echo "WARNING: if this host is the SUSPECT machine, do not trust a binary built"
+    echo "         here - the compiler itself runs on possibly-failing cores. Prefer"
+    echo "         'make static' on a trusted machine, copy the binary over, and"
+    echo "         verify its SHA256 (sha256sum $BIN) before running."
     make -C "$DIR"
 fi
 
@@ -29,6 +33,11 @@ Commands:
   overnight [H] Timed soak: loop until H hours elapse (default 8), log to file.
                 Each pass = long parallel stress + short sequential isolation.
   docker        100 iterations, 4MB blocks (mimics typical Docker layer chunk)
+  kat [I]       Known-answer test: verify against golden digests precomputed
+                on a trusted machine (default 100 iterations, fixed 4MB block)
+  vote [I]      Cross-core voting screen: all cores run identical input,
+                majority rules on compressed digests (default 100 rounds).
+                Writes a digest log for offline verification.
 
   sequential    Sequential only (one core at a time, identifies bad core)
   parallel      Parallel only (all cores at once, finds errors under load)
@@ -44,9 +53,9 @@ case "${1:-help}" in
     build)    make -C "$DIR" ;;
     deps)     make -C "$DIR" deps ;;
     check)    make -C "$DIR" check-deps ;;
-    quick)    sudo "$BIN" -m both -i 1 -a all -v ;;
-    standard) sudo "$BIN" -m both -i 100 -a all ;;
-    soak)     sudo "$BIN" -m both -i 1000 -a all ;;
+    quick)    "$BIN" -m both -i 1 -a all -v ;;
+    standard) "$BIN" -m both -i 100 -a all ;;
+    soak)     "$BIN" -m both -i 1000 -a all ;;
     overnight)
         HOURS="${2:-8}"
         LOG="$DIR/soak_$(date +%Y%m%d_%H%M%S).log"
@@ -69,16 +78,19 @@ case "${1:-help}" in
         CORR=$(grep -c CORRUPTION "$LOG" || true)
         echo "RESULT: $CORR corruption events (log: $LOG)"
         ;;
-    docker)   sudo "$BIN" -m both -i 100 -s 4 -a all ;;
-    sequential) sudo "$BIN" -m sequential -i 100 -a all -v ;;
-    parallel) sudo "$BIN" -m parallel -i 100 -a all -v ;;
+    docker)   "$BIN" -m both -i 100 -s 4 -a all ;;
+    kat)      "$BIN" -m both -i "${2:-100}" -a all -k ;;
+    vote)     "$BIN" -m parallel -V -i "${2:-100}" -a all \
+                --digest-log "$DIR/vote_$(date +%Y%m%d_%H%M%S).log" ;;
+    sequential) "$BIN" -m sequential -i 100 -a all -v ;;
+    parallel) "$BIN" -m parallel -i 100 -a all -v ;;
     core)
         [ -z "$2" ] && { echo "Usage: $0 core <N> [iterations]"; exit 1; }
-        sudo "$BIN" -m sequential -c 1 -o "$2" -i "${3:-100}" -a all -v
+        "$BIN" -m sequential -c 1 -o "$2" -i "${3:-100}" -a all -v
         ;;
     core-soak)
         [ -z "$2" ] && { echo "Usage: $0 core-soak <N> [iterations]"; exit 1; }
-        sudo "$BIN" -m sequential -c 1 -o "$2" -i "${3:-1000}" -a all -v
+        "$BIN" -m sequential -c 1 -o "$2" -i "${3:-1000}" -a all -v
         ;;
     help|-h|--help) usage ;;
     *) echo "Unknown command: $1"; usage; exit 1 ;;
