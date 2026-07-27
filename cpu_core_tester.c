@@ -29,7 +29,7 @@ typedef enum {
     MODE_SEQUENTIAL,
     MODE_PARALLEL,
     MODE_BOTH,
-} mode_t;
+} run_mode_t;
 
 typedef struct {
     int core_id;
@@ -433,7 +433,7 @@ int main(int argc, char **argv) {
     int iterations = DEFAULT_ITERATIONS;
     size_t data_size = 16 * 1024 * 1024;
     algorithm_t algorithm = ALG_ALL;
-    mode_t mode = MODE_BOTH;
+    run_mode_t mode = MODE_BOTH;
     int verbose = 0;
 
     for (int i = 1; i < argc; i++) {
