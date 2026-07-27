@@ -26,6 +26,8 @@ Commands:
   quick         1 iteration, all cores, all algs, both modes
   standard      100 iterations
   soak          1000 iterations
+  overnight [H] Timed soak: loop until H hours elapse (default 8), log to file.
+                Each pass = long parallel stress + short sequential isolation.
   docker        100 iterations, 4MB blocks (mimics typical Docker layer chunk)
 
   sequential    Sequential only (one core at a time, identifies bad core)
@@ -45,6 +47,28 @@ case "${1:-help}" in
     quick)    sudo "$BIN" -m both -i 1 -a all -v ;;
     standard) sudo "$BIN" -m both -i 100 -a all ;;
     soak)     sudo "$BIN" -m both -i 1000 -a all ;;
+    overnight)
+        HOURS="${2:-8}"
+        LOG="$DIR/soak_$(date +%Y%m%d_%H%M%S).log"
+        END=$(( $(date +%s) + HOURS * 3600 ))
+        PASS=0
+        echo "Overnight soak: ${HOURS}h, logging to $LOG"
+        {
+            echo "===== soak start: $(date -Is) | host: $(hostname) | ${HOURS}h ====="
+            while [ "$(date +%s)" -lt "$END" ]; do
+                PASS=$((PASS + 1))
+                echo ""
+                echo "===== pass $PASS | $(date -Is) ====="
+                "$BIN" -m parallel -i 200 -a all || true
+                "$BIN" -m sequential -i 20 -a all || true
+            done
+            echo ""
+            echo "===== soak end: $(date -Is) | passes: $PASS ====="
+        } 2>&1 | tee "$LOG"
+        echo ""
+        CORR=$(grep -c CORRUPTION "$LOG" || true)
+        echo "RESULT: $CORR corruption events (log: $LOG)"
+        ;;
     docker)   sudo "$BIN" -m both -i 100 -s 4 -a all ;;
     sequential) sudo "$BIN" -m sequential -i 100 -a all -v ;;
     parallel) sudo "$BIN" -m parallel -i 100 -a all -v ;;
