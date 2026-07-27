@@ -14,6 +14,7 @@
 #include <zlib.h>
 #include <zstd.h>
 #include <lz4.h>
+#include <lzma.h>
 
 #include <openssl/sha.h>
 
@@ -65,7 +66,9 @@ typedef enum {
     ALG_ZLIB,
     ALG_ZSTD,
     ALG_LZ4,
+    ALG_XZ,
     ALG_MEMCPY,
+    ALG_HAMMER,
     ALG_ALL,
 } algorithm_t;
 
@@ -83,6 +86,7 @@ typedef struct {
     int kat;
     int iopath;              /* route blobs through the kernel (tmpfs), like docker */
     int burst_ms;            /* idle gap between iterations; 0 = continuous */
+    int duration_sec;        /* wall-clock dwell; 0 = use iterations instead */
 } run_opts_t;
 
 typedef struct {
@@ -97,6 +101,7 @@ typedef struct {
     int kat;
     int iopath;
     int burst_ms;
+    time_t end_time;         /* if nonzero, loop until this time (duration mode) */
     int vote;
     uint8_t *vote_digests;     /* per-core buffer: iterations*alg_count digests, or NULL */
 } worker_args_t;
@@ -208,6 +213,155 @@ static int guard_check(const uint8_t *p, size_t size) {
 static void guarded_free(void *p) {
     if (p)
         free((uint8_t *)p - GUARD_BAND_BYTES);
+}
+
+/*
+ * Unit hammer (-a hammer): deterministic multiply/FMA kernel targeting the
+ * execution units generic codec workloads never touch - AVX512-IFMA
+ * vpmadd52, vpmullq, FP FMA; AVX2 vpmuludq/vpmulld/FMA; scalar imul.
+ * Modeled on the coworker's sdc_mul_hammer.c, but with runtime dispatch
+ * via GCC/Clang function target attributes, so one portable binary runs
+ * on any x86-64 and picks the best kernel the CPU supports (no SIGILL on
+ * older Xeons). Golden is the worker's round-0 checksum; --vote compares
+ * hammer checksums across cores, which closes the self-reference hole a
+ * round-0 golden has on a deterministically-wrong core.
+ */
+#define HAMMER_INNER 4096
+#define HAMMER_VECS 512
+
+typedef uint64_t (*hammer_fn)(uint64_t salt);
+static hammer_fn g_hammer;
+static const char *g_hammer_name;
+
+static uint64_t hammer_scalar(uint64_t salt) {
+    uint64_t acc = 0x9E3779B97F4A7C15ULL ^ salt;
+    uint64_t mul = 0xD1B54A32D192ED03ULL;
+    uint64_t buf[HAMMER_VECS];
+    for (int i = 0; i < HAMMER_VECS; i++)
+        buf[i] = 0x0123456789ABCDEFULL * (uint64_t)(i + 1) + 0xC0FFEEULL + salt;
+
+    for (int r = 0; r < HAMMER_INNER; r++) {
+        for (int v = 0; v < HAMMER_VECS; v++) {
+            uint64_t x = buf[v];
+            __asm__ volatile("" : "+r"(x)); /* stop the optimizer folding this */
+            acc += x * mul;                 /* integer multiply chain */
+            mul ^= acc >> 7;
+        }
+    }
+    return acc ^ (mul * 0x9E3779B97F4A7C15ULL);
+}
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define HAVE_X86_HAMMER 1
+#include <immintrin.h>
+
+/* AVX512-IFMA big-integer multiply-add + vpmullq + FP FMA (Ice Lake+). */
+__attribute__((target("avx512f,avx512dq,avx512ifma")))
+static uint64_t hammer_avx512(uint64_t salt) {
+    __m512i acc_i = _mm512_set1_epi64(0x9E3779B97F4A7C15ULL ^ salt);
+    __m512i mul   = _mm512_set1_epi64(0xD1B54A32D192ED03ULL);
+    __m512d acc_f = _mm512_set1_pd(1.0000001);
+    __m512d cf    = _mm512_set1_pd(1.0000003);
+
+    uint64_t seed[8 * HAMMER_VECS];
+    for (int i = 0; i < 8 * HAMMER_VECS; i++)
+        seed[i] = 0x0123456789ABCDEFULL * (uint64_t)(i + 1) + 0xC0FFEEULL + salt;
+
+    for (int r = 0; r < HAMMER_INNER; r++) {
+        for (int v = 0; v < HAMMER_VECS; v++) {
+            __m512i x = _mm512_loadu_si512((const void *)(seed + v * 8));
+            __asm__ volatile("" : "+v"(x));
+
+            acc_i = _mm512_madd52lo_epu64(acc_i, x, mul);
+            acc_i = _mm512_madd52hi_epu64(acc_i, x, mul);
+            acc_i = _mm512_add_epi64(acc_i, _mm512_mullo_epi64(x, mul));
+
+            __m512d xf = _mm512_cvtepu64_pd(x);
+            acc_f = _mm512_fmadd_pd(xf, cf, acc_f);
+
+            mul = _mm512_xor_si512(mul, _mm512_srli_epi64(acc_i, 7));
+        }
+    }
+
+    uint64_t out[8];
+    _mm512_storeu_si512((void *)out, acc_i);
+    double ftmp[8];
+    _mm512_storeu_pd(ftmp, acc_f);
+
+    uint64_t chk = 0;
+    for (int i = 0; i < 8; i++) {
+        uint64_t fbits;
+        memcpy(&fbits, &ftmp[i], sizeof(fbits));
+        chk ^= out[i] + 0x9E3779B97F4A7C15ULL * (uint64_t)(i + 1);
+        chk = (chk << 13) | (chk >> 51);
+        chk += fbits;
+    }
+    return chk;
+}
+
+/* AVX2/FMA fallback: vpmuludq both halves + vpmulld + FP FMA. */
+__attribute__((target("avx2,fma")))
+static uint64_t hammer_avx2(uint64_t salt) {
+    __m256i acc_i = _mm256_set1_epi64x(0x9E3779B97F4A7C15ULL ^ salt);
+    __m256i mul   = _mm256_set1_epi64x(0xD1B54A32D192ED03ULL);
+    __m256d acc_f = _mm256_set1_pd(1.0000001);
+    __m256d cf    = _mm256_set1_pd(1.0000003);
+
+    uint64_t seed[4 * HAMMER_VECS];
+    for (int i = 0; i < 4 * HAMMER_VECS; i++)
+        seed[i] = 0x0123456789ABCDEFULL * (uint64_t)(i + 1) + 0xC0FFEEULL + salt;
+
+    for (int r = 0; r < HAMMER_INNER; r++) {
+        for (int v = 0; v < HAMMER_VECS; v++) {
+            __m256i x = _mm256_loadu_si256((const __m256i *)(seed + v * 4));
+            __asm__ volatile("" : "+x"(x));
+
+            __m256i lo = _mm256_mul_epu32(x, mul);
+            __m256i hi = _mm256_mul_epu32(_mm256_srli_epi64(x, 32),
+                                          _mm256_srli_epi64(mul, 32));
+            acc_i = _mm256_add_epi64(acc_i, _mm256_add_epi64(lo, hi));
+            acc_i = _mm256_add_epi64(acc_i, _mm256_mullo_epi32(x, mul));
+
+            __m256d xf = _mm256_cvtepi32_pd(_mm256_castsi256_si128(x));
+            acc_f = _mm256_fmadd_pd(xf, cf, acc_f);
+
+            mul = _mm256_xor_si256(mul, _mm256_srli_epi64(acc_i, 7));
+        }
+    }
+
+    uint64_t out[4];
+    _mm256_storeu_si256((__m256i *)out, acc_i);
+    double ftmp[4];
+    _mm256_storeu_pd(ftmp, acc_f);
+
+    uint64_t chk = 0;
+    for (int i = 0; i < 4; i++) {
+        uint64_t fbits;
+        memcpy(&fbits, &ftmp[i], sizeof(fbits));
+        chk ^= out[i] + 0x9E3779B97F4A7C15ULL * (uint64_t)(i + 1);
+        chk = (chk << 13) | (chk >> 51);
+        chk += fbits;
+    }
+    return chk;
+}
+#endif /* __x86_64__ */
+
+static void hammer_init(void) {
+#if HAVE_X86_HAMMER
+    __builtin_cpu_init();
+    if (__builtin_cpu_supports("avx512ifma") && __builtin_cpu_supports("avx512dq")) {
+        g_hammer = hammer_avx512;
+        g_hammer_name = "avx512-ifma (vpmadd52/vpmullq/fmadd)";
+        return;
+    }
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+        g_hammer = hammer_avx2;
+        g_hammer_name = "avx2+fma (vpmuludq/vpmulld/fmadd)";
+        return;
+    }
+#endif
+    g_hammer = hammer_scalar;
+    g_hammer_name = "scalar (imul)";
 }
 
 /*
@@ -411,6 +565,53 @@ static int test_lz4(const uint8_t *data, size_t data_size,
 }
 
 /*
+ * xz/LZMA (-a xz): range-coder workload, much heavier integer path than
+ * deflate-style codecs. LZMA_CHECK_CRC64 gives the decompressor's own
+ * integrity check as a second, independent verification.
+ */
+static int test_xz(const uint8_t *data, size_t data_size,
+                    const uint8_t expected_hash[SHA256_DIGEST_LENGTH],
+                    uint8_t *comp_digest) {
+    size_t bound = lzma_stream_buffer_bound(data_size);
+    uint8_t *compressed = malloc(bound);
+    uint8_t *decompressed = guarded_malloc(data_size);
+    if (!compressed || !decompressed) {
+        free(compressed); guarded_free(decompressed);
+        return -1;
+    }
+
+    size_t comp_size = 0;
+    lzma_ret enc = lzma_easy_buffer_encode(LZMA_PRESET_DEFAULT, LZMA_CHECK_CRC64,
+                                            NULL, data, data_size,
+                                            compressed, &comp_size, bound);
+    if (enc != LZMA_OK) {
+        free(compressed); guarded_free(decompressed);
+        return -1;
+    }
+    if (comp_digest)
+        SHA256(compressed, comp_size, comp_digest);
+
+    size_t in_pos = 0, out_pos = 0;
+    uint64_t memlimit = UINT64_MAX;
+    lzma_ret dec = lzma_stream_buffer_decode(&memlimit, 0, NULL,
+                                              compressed, &in_pos, comp_size,
+                                              decompressed, &out_pos, data_size);
+
+    int result = 0;
+    if (dec != LZMA_OK || out_pos != data_size) {
+        result = -1;
+    } else {
+        result = verify_output(data, decompressed, data_size, expected_hash);
+    }
+    if (guard_check(decompressed, data_size) != 0)
+        result = -1;
+
+    free(compressed);
+    guarded_free(decompressed);
+    return result;
+}
+
+/*
  * Memory-path workout (-a memcpy): no codec, just bulk copies through the
  * core<->cache<->IMC<->DRAM path, verified at each step. Compression is
  * compute-bound and under-stresses the memory path; saturated memcpy
@@ -471,6 +672,12 @@ static size_t iopath_compress(algorithm_t alg, uint8_t *dst, size_t cap,
             uLongf blen = cap;
             return compress2(dst, &blen, src, n, Z_DEFAULT_COMPRESSION) == Z_OK ? blen : 0;
         }
+        case ALG_XZ: {
+            size_t out_pos = 0;
+            return lzma_easy_buffer_encode(LZMA_PRESET_DEFAULT, LZMA_CHECK_CRC64,
+                                           NULL, src, n, dst, &out_pos,
+                                           cap) == LZMA_OK ? out_pos : 0;
+        }
         default:
             return 0;
     }
@@ -490,6 +697,12 @@ static size_t iopath_decompress(algorithm_t alg, uint8_t *dst, size_t cap,
         case ALG_ZLIB: {
             uLongf blen = cap;
             return uncompress(dst, &blen, src, n) == Z_OK ? blen : 0;
+        }
+        case ALG_XZ: {
+            size_t in_pos = 0, out_pos = 0;
+            uint64_t memlimit = UINT64_MAX;
+            return lzma_stream_buffer_decode(&memlimit, 0, NULL, src, &in_pos, n,
+                                             dst, &out_pos, cap) == LZMA_OK ? out_pos : 0;
         }
         default:
             return 0;
@@ -535,8 +748,11 @@ static size_t kernel_roundtrip(const uint8_t *in, size_t size, uint8_t *out, int
 static int test_iopath(algorithm_t alg, const uint8_t *data, size_t data_size,
                         const uint8_t expected_hash[SHA256_DIGEST_LENGTH],
                         uint8_t *comp_digest, int core_id) {
-    /* ZSTD's bound is the largest of the three libraries' bounds. */
+    /* Largest of the libraries' bounds (lzma's exceeds zstd's). */
     size_t bound = ZSTD_compressBound(data_size);
+    size_t xz_bound = lzma_stream_buffer_bound(data_size);
+    if (xz_bound > bound)
+        bound = xz_bound;
     uint8_t *comp = malloc(bound);
     uint8_t *comp_back = malloc(bound);
     uint8_t *decomp = guarded_malloc(data_size);
@@ -608,7 +824,9 @@ static const char *alg_name(algorithm_t alg) {
         case ALG_ZLIB: return "zlib";
         case ALG_ZSTD: return "zstd";
         case ALG_LZ4:  return "lz4";
+        case ALG_XZ:   return "xz";
         case ALG_MEMCPY: return "memcpy";
+        case ALG_HAMMER: return "hammer";
         default:       return "unknown";
     }
 }
@@ -620,8 +838,9 @@ static int run_algorithm(algorithm_t alg, const uint8_t *data, size_t data_size,
         case ALG_ZLIB: return test_zlib(data, data_size, expected_hash, comp_digest);
         case ALG_ZSTD: return test_zstd(data, data_size, expected_hash, comp_digest);
         case ALG_LZ4:  return test_lz4(data, data_size, expected_hash, comp_digest);
+        case ALG_XZ:   return test_xz(data, data_size, expected_hash, comp_digest);
         case ALG_MEMCPY: return test_memcpy(data, data_size, expected_hash, comp_digest);
-        default:       return -1;
+        default:       return -1; /* ALG_HAMMER is handled in the worker */
     }
 }
 
@@ -674,11 +893,25 @@ static void *worker_thread(void *arg) {
     uint64_t base_seed = args->vote ? VOTE_BASE_SEED
                                     : GOLDEN_RATIO_64 * (uint64_t)(args->core_id + 1);
 
-    for (int iter = 0; iter < args->iterations && !g_shutdown; iter++) {
+    uint64_t hammer_golden = 0;
+    int hammer_have_golden = 0;
+
+    for (int iter = 0; !g_shutdown; iter++) {
+        if (args->end_time) {
+            if (time(NULL) >= args->end_time)
+                break;
+        } else if (iter >= args->iterations) {
+            break;
+        }
+
         const uint8_t *expected;
         uint8_t hash[SHA256_DIGEST_LENGTH];
 
-        if (args->kat) {
+        if (args->algorithm == ALG_HAMMER) {
+            /* Hammer dwells on execution units; don't waste cycles filling
+             * a data buffer it never reads. */
+            expected = hash;
+        } else if (args->kat) {
             /* Ground truth is the baked-in golden digest, computed on a
              * trusted machine - never anything produced by this core. */
             const kat_vector_t *v = &KAT_VECTORS[iter % KAT_VECTOR_COUNT];
@@ -696,6 +929,35 @@ static void *worker_thread(void *arg) {
             if (args->vote_digests)
                 slot = args->vote_digests +
                        ((size_t)iter * alg_count + a) * SHA256_DIGEST_LENGTH;
+            if (algorithms[a] == ALG_HAMMER) {
+                uint64_t c = g_hammer(base_seed);
+                if (slot)
+                    SHA256((const uint8_t *)&c, sizeof(c), slot);
+                if (!hammer_have_golden) {
+                    /* Round-0 golden CAVEAT: a deterministically-wrong core
+                     * adopts its own wrong answer as golden and passes.
+                     * Cross-check with --vote (the herd is the reference)
+                     * or a golden from a trusted machine. */
+                    hammer_golden = c;
+                    hammer_have_golden = 1;
+                    pthread_mutex_lock(args->print_mutex);
+                    printf("[CORE %2d] hammer golden=%016llx (%s)\n",
+                           args->core_id, (unsigned long long)c, g_hammer_name);
+                    pthread_mutex_unlock(args->print_mutex);
+                    continue;
+                }
+                if (c != hammer_golden) {
+                    core_errors++;
+                    pthread_mutex_lock(args->print_mutex);
+                    printf("[CORE %2d] CORRUPTION iter=%d algorithm=hammer "
+                           "got=%016llx exp=%016llx\n",
+                           args->core_id, iter,
+                           (unsigned long long)c, (unsigned long long)hammer_golden);
+                    pthread_mutex_unlock(args->print_mutex);
+                }
+                continue;
+            }
+
             int rc = args->iopath
                 ? test_iopath(algorithms[a], data, args->data_size, expected, slot,
                               args->core_id)
@@ -719,8 +981,12 @@ static void *worker_thread(void *arg) {
 
         if (args->verbose && (iter + 1) % VERBOSE_INTERVAL == 0) {
             pthread_mutex_lock(args->print_mutex);
-            printf("[CORE %2d] %d/%d iterations, %d errors\n",
-                   args->core_id, iter + 1, args->iterations, core_errors);
+            if (args->end_time)
+                printf("[CORE %2d] %d iterations, %d errors\n",
+                       args->core_id, iter + 1, core_errors);
+            else
+                printf("[CORE %2d] %d/%d iterations, %d errors\n",
+                       args->core_id, iter + 1, args->iterations, core_errors);
             pthread_mutex_unlock(args->print_mutex);
         }
 
@@ -795,9 +1061,14 @@ static void print_core_list(const char *label, const int *cores, int count) {
  */
 static int run_sequential(int num_cores, int offset, const run_opts_t *opts) {
     printf("\n=== SEQUENTIAL: one core at a time ===\n");
-    printf("Cores: %d-%d | Iterations: %d | Block: %zu MB\n\n",
-           offset, offset + num_cores - 1, opts->iterations,
-           opts->data_size / (1024 * 1024));
+    if (opts->duration_sec)
+        printf("Cores: %d-%d | Duration: %ds | Block: %zu MB\n\n",
+               offset, offset + num_cores - 1, opts->duration_sec,
+               opts->data_size / (1024 * 1024));
+    else
+        printf("Cores: %d-%d | Iterations: %d | Block: %zu MB\n\n",
+               offset, offset + num_cores - 1, opts->iterations,
+               opts->data_size / (1024 * 1024));
 
     int total_errors = 0;
     int bad_cores[MAX_CORES];
@@ -826,6 +1097,7 @@ static int run_sequential(int num_cores, int offset, const run_opts_t *opts) {
             .kat = opts->kat,
             .iopath = opts->iopath,
             .burst_ms = opts->burst_ms,
+            .end_time = opts->duration_sec ? time(NULL) + opts->duration_sec : 0,
         };
 
         pthread_t thread;
@@ -871,9 +1143,14 @@ static int run_sequential(int num_cores, int offset, const run_opts_t *opts) {
  */
 static int run_parallel(int num_cores, int offset, const run_opts_t *opts) {
     printf("\n=== PARALLEL: all cores at once ===\n");
-    printf("Cores: %d-%d | Iterations: %d | Block: %zu MB\n\n",
-           offset, offset + num_cores - 1, opts->iterations,
-           opts->data_size / (1024 * 1024));
+    if (opts->duration_sec)
+        printf("Cores: %d-%d | Duration: %ds | Block: %zu MB\n\n",
+               offset, offset + num_cores - 1, opts->duration_sec,
+               opts->data_size / (1024 * 1024));
+    else
+        printf("Cores: %d-%d | Iterations: %d | Block: %zu MB\n\n",
+               offset, offset + num_cores - 1, opts->iterations,
+               opts->data_size / (1024 * 1024));
 
     int errors[MAX_CORES] = {0};
     int tested[MAX_CORES] = {0};
@@ -897,6 +1174,7 @@ static int run_parallel(int num_cores, int offset, const run_opts_t *opts) {
             .kat = opts->kat,
             .iopath = opts->iopath,
             .burst_ms = opts->burst_ms,
+            .end_time = opts->duration_sec ? time(NULL) + opts->duration_sec : 0,
         };
         int rc = pthread_create(&threads[i], NULL, worker_thread, &args[i]);
         if (rc != 0) {
@@ -1006,6 +1284,7 @@ static int run_vote(int num_cores, int offset, const run_opts_t *opts,
             .kat = opts->kat,
             .iopath = opts->iopath,
             .burst_ms = opts->burst_ms,
+            .end_time = opts->duration_sec ? time(NULL) + opts->duration_sec : 0,
             .vote = 1,
             .vote_digests = all_digests + (size_t)i * rounds * SHA256_DIGEST_LENGTH,
         };
@@ -1143,7 +1422,8 @@ static void print_usage(const char *prog) {
     printf("  -o, --offset N       Start testing at core N (default: 0)\n");
     printf("  -i, --iterations N   Iterations per core (default: %d)\n", DEFAULT_ITERATIONS);
     printf("  -s, --size MB        Block size in MB (default: %d)\n", DEFAULT_BLOCK_MB);
-    printf("  -a, --alg ALG        zlib | zstd | lz4 | memcpy | all (default: all)\n");
+    printf("  -a, --alg ALG        zlib | zstd | lz4 | xz | memcpy | hammer | all\n");
+    printf("                       (default: all = zstd + lz4 + zlib)\n");
     printf("  -m, --mode MODE      sequential | parallel | both (default: both)\n");
     printf("  -V, --vote           Cross-core vote (parallel phase): identical input on\n");
     printf("                       all cores, majority rules on compressed digests\n");
@@ -1156,6 +1436,8 @@ static void print_usage(const char *prog) {
     printf("  -b, --burst MS       Sleep MS ms between iterations: idle<->boost\n");
     printf("                       transitions trigger marginal silicon (0 = off)\n");
     printf("  -T, --topology       Print logical CPU -> socket/physical-core map, exit\n");
+    printf("  -d, --duration SEC   Run for SEC seconds instead of fixed iterations\n");
+    printf("                       (not with --vote; rounds must be fixed)\n");
     printf("  -v, --verbose        Show progress\n");
     printf("  -h, --help           Help\n");
     printf("\nExit code: 0 = all tested cores clean, 1 = bad cores found,\n");
@@ -1181,6 +1463,7 @@ int main(int argc, char **argv) {
     int iopath = 0;
     int burst_ms = 0;
     int topology = 0;
+    int duration_sec = 0;
     const char *digest_log = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -1202,7 +1485,9 @@ int main(int argc, char **argv) {
             if      (strcmp(argv[i], "zlib") == 0) algorithm = ALG_ZLIB;
             else if (strcmp(argv[i], "zstd") == 0) algorithm = ALG_ZSTD;
             else if (strcmp(argv[i], "lz4") == 0)  algorithm = ALG_LZ4;
+            else if (strcmp(argv[i], "xz") == 0)   algorithm = ALG_XZ;
             else if (strcmp(argv[i], "memcpy") == 0) algorithm = ALG_MEMCPY;
+            else if (strcmp(argv[i], "hammer") == 0) algorithm = ALG_HAMMER;
             else if (strcmp(argv[i], "all") == 0)  algorithm = ALG_ALL;
             else { fprintf(stderr, "Unknown alg: %s\n", argv[i]); return 1; }
         } else if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--mode") == 0) && i+1 < argc) {
@@ -1223,6 +1508,8 @@ int main(int argc, char **argv) {
             iopath = 1;
         } else if ((strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--burst") == 0) && i+1 < argc)
             burst_ms = atoi(argv[++i]);
+        else if ((strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--duration") == 0) && i+1 < argc)
+            duration_sec = atoi(argv[++i]);
         else if (strcmp(argv[i], "-T") == 0 || strcmp(argv[i], "--topology") == 0) {
             topology = 1;
         } else {
@@ -1244,6 +1531,13 @@ int main(int argc, char **argv) {
     }
     if (burst_ms < 0)
         burst_ms = 0;
+    if (duration_sec < 0)
+        duration_sec = 0;
+    if (duration_sec > 0 && vote) {
+        fprintf(stderr, "--duration cannot be combined with --vote (rounds must be fixed)\n");
+        return 1;
+    }
+    hammer_init();
     if (iopath) {
         g_iopath_dir = pick_iopath_dir();
         if (!g_iopath_dir) {
@@ -1281,6 +1575,10 @@ int main(int argc, char **argv) {
         printf("IO path:    kernel round-trip via %s (docker blob path)\n", g_iopath_dir);
     if (burst_ms > 0)
         printf("Burst:      %d ms idle between iterations\n", burst_ms);
+    if (duration_sec > 0)
+        printf("Duration:   %d s (overrides iterations)\n", duration_sec);
+    if (algorithm == ALG_HAMMER)
+        printf("Hammer:     %s\n", g_hammer_name);
 
     run_opts_t opts = {
         .iterations = iterations,
@@ -1290,6 +1588,7 @@ int main(int argc, char **argv) {
         .kat = kat,
         .iopath = iopath,
         .burst_ms = burst_ms,
+        .duration_sec = duration_sec,
     };
 
     int result = EXIT_CLEAN;

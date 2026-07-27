@@ -47,6 +47,11 @@ Commands:
   memory [I] [MB]  Memory-path workout: verified saturated memcpy through
                 caches/IMC/DRAM (default 100 iters, 256MB blocks).
                 RAM cost ~3x block per core. Use blocks larger than L3.
+  hammer <cpu> [SEC]  Unit hammer pinned to one logical CPU: multiply/FMA
+                kernel (AVX512-IFMA when available), timed dwell
+                (default 60s). y-cruncher-style conviction run.
+  hammer-vote [I] Cross-core vote on hammer checksums: closes the
+                round-0-golden self-reference hole (default 50 rounds)
 
   sequential    Sequential only (one core at a time, identifies bad core)
   parallel      Parallel only (all cores at once, finds errors under load)
@@ -78,6 +83,7 @@ case "${1:-help}" in
                 echo ""
                 echo "===== pass $PASS | $(date -Is) ====="
                 "$BIN" -m parallel -i 200 -a all || true
+                "$BIN" -m parallel -d 120 -a hammer || true
                 "$BIN" -m sequential -i 20 -a all || true
             done
             echo ""
@@ -95,6 +101,11 @@ case "${1:-help}" in
     burst)    "$BIN" -m both -i "${2:-200}" -a all -b 50 ;;
     topology) "$BIN" -T ;;
     memory)   "$BIN" -m both -i "${2:-100}" -s "${3:-256}" -a memcpy ;;
+    hammer)
+        [ -z "$2" ] && { echo "Usage: $0 hammer <cpu> [seconds]"; exit 1; }
+        "$BIN" -m sequential -c 1 -o "$2" -d "${3:-60}" -a hammer -v
+        ;;
+    hammer-vote) "$BIN" -m parallel -V -i "${2:-50}" -a hammer ;;
     sequential) "$BIN" -m sequential -i 100 -a all -v ;;
     parallel) "$BIN" -m parallel -i 100 -a all -v ;;
     core)

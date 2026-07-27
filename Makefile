@@ -1,8 +1,8 @@
 CC = gcc
 CFLAGS = -O2 -Wall -Wextra -pthread
-LDFLAGS = -lz -lzstd -llz4 -lssl -lcrypto
+LDFLAGS = -lz -lzstd -llz4 -llzma -lssl -lcrypto
 # Static link needs libdl for libcrypto on glibc.
-LDFLAGS_STATIC = -lz -lzstd -llz4 -lcrypto -ldl
+LDFLAGS_STATIC = -lz -lzstd -llz4 -llzma -lcrypto -ldl
 
 TARGET = cpu_core_tester
 SRC = cpu_core_tester.c
@@ -38,6 +38,7 @@ deps:
 		libz-dev \
 		libzstd-dev \
 		liblz4-dev \
+		liblzma-dev \
 		libssl-dev \
 		build-essential
 
@@ -46,6 +47,7 @@ check-deps:
 	@pkg-config --exists zlib 2>/dev/null && echo "  zlib:   found" || echo "  zlib:   MISSING (libz-dev)"
 	@pkg-config --exists libzstd 2>/dev/null && echo "  zstd:   found" || echo "  zstd:   MISSING (libzstd-dev)"
 	@pkg-config --exists liblz4 2>/dev/null && echo "  lz4:    found" || echo "  lz4:    MISSING (liblz4-dev)"
+	@pkg-config --exists liblzma 2>/dev/null && echo "  lzma:   found" || echo "  lzma:   MISSING (liblzma-dev)"
 	@pkg-config --exists openssl 2>/dev/null && echo "  ssl:    found" || echo "  ssl:    MISSING (libssl-dev)"
 
 install: $(TARGET)
