@@ -65,6 +65,7 @@ typedef enum {
     ALG_ZLIB,
     ALG_ZSTD,
     ALG_LZ4,
+    ALG_MEMCPY,
     ALG_ALL,
 } algorithm_t;
 
@@ -410,6 +411,41 @@ static int test_lz4(const uint8_t *data, size_t data_size,
 }
 
 /*
+ * Memory-path workout (-a memcpy): no codec, just bulk copies through the
+ * core<->cache<->IMC<->DRAM path, verified at each step. Compression is
+ * compute-bound and under-stresses the memory path; saturated memcpy
+ * hammers load/store ports, cache fill/evict and the memory controller
+ * per unit time. Discriminates: codecs pass + memcpy fails = memory path;
+ * both fail = execution core. Use a block larger than L3 so traffic
+ * reaches DRAM; RAM cost is ~3x block size per tested core.
+ */
+static int test_memcpy(const uint8_t *data, size_t data_size,
+                        const uint8_t expected_hash[SHA256_DIGEST_LENGTH],
+                        uint8_t *comp_digest) {
+    uint8_t *copy = guarded_malloc(data_size);
+    uint8_t *copy_back = guarded_malloc(data_size);
+    if (!copy || !copy_back) {
+        guarded_free(copy); guarded_free(copy_back);
+        return -1;
+    }
+
+    memcpy(copy, data, data_size);       /* stores: core -> caches -> DRAM */
+    memcpy(copy_back, copy, data_size);  /* loads + stores back the other way */
+
+    if (comp_digest)
+        SHA256(copy_back, data_size, comp_digest);
+
+    int result = verify_output(data, copy_back, data_size, expected_hash);
+    if (guard_check(copy, data_size) != 0 ||
+        guard_check(copy_back, data_size) != 0)
+        result = -1;
+
+    guarded_free(copy);
+    guarded_free(copy_back);
+    return result;
+}
+
+/*
  * Kernel I/O path (--iopath).
  *
  * A docker pull does not decompress in a userspace vacuum: the layer blob
@@ -509,7 +545,15 @@ static int test_iopath(algorithm_t alg, const uint8_t *data, size_t data_size,
         return -1;
     }
 
-    size_t comp_size = iopath_compress(alg, comp, bound, data, data_size);
+    /* For ALG_MEMCPY there is no codec: the raw block itself goes through
+     * the kernel path (mirrors the untar/apply side of a docker pull). */
+    size_t comp_size;
+    if (alg == ALG_MEMCPY) {
+        memcpy(comp, data, data_size);
+        comp_size = data_size;
+    } else {
+        comp_size = iopath_compress(alg, comp, bound, data, data_size);
+    }
     if (comp_size == 0 ||
         kernel_roundtrip(comp, comp_size, comp_back, core_id) != comp_size ||
         memcmp(comp, comp_back, comp_size) != 0) {
@@ -520,7 +564,13 @@ static int test_iopath(algorithm_t alg, const uint8_t *data, size_t data_size,
     if (comp_digest)
         SHA256(comp_back, comp_size, comp_digest);
 
-    size_t decomp_size = iopath_decompress(alg, decomp, data_size, comp_back, comp_size);
+    size_t decomp_size;
+    if (alg == ALG_MEMCPY) {
+        memcpy(decomp, comp_back, comp_size);
+        decomp_size = comp_size;
+    } else {
+        decomp_size = iopath_decompress(alg, decomp, data_size, comp_back, comp_size);
+    }
 
     int result = 0;
     if (decomp_size != data_size) {
@@ -558,6 +608,7 @@ static const char *alg_name(algorithm_t alg) {
         case ALG_ZLIB: return "zlib";
         case ALG_ZSTD: return "zstd";
         case ALG_LZ4:  return "lz4";
+        case ALG_MEMCPY: return "memcpy";
         default:       return "unknown";
     }
 }
@@ -569,6 +620,7 @@ static int run_algorithm(algorithm_t alg, const uint8_t *data, size_t data_size,
         case ALG_ZLIB: return test_zlib(data, data_size, expected_hash, comp_digest);
         case ALG_ZSTD: return test_zstd(data, data_size, expected_hash, comp_digest);
         case ALG_LZ4:  return test_lz4(data, data_size, expected_hash, comp_digest);
+        case ALG_MEMCPY: return test_memcpy(data, data_size, expected_hash, comp_digest);
         default:       return -1;
     }
 }
@@ -1091,7 +1143,7 @@ static void print_usage(const char *prog) {
     printf("  -o, --offset N       Start testing at core N (default: 0)\n");
     printf("  -i, --iterations N   Iterations per core (default: %d)\n", DEFAULT_ITERATIONS);
     printf("  -s, --size MB        Block size in MB (default: %d)\n", DEFAULT_BLOCK_MB);
-    printf("  -a, --alg ALG        zlib | zstd | lz4 | all (default: all)\n");
+    printf("  -a, --alg ALG        zlib | zstd | lz4 | memcpy | all (default: all)\n");
     printf("  -m, --mode MODE      sequential | parallel | both (default: both)\n");
     printf("  -V, --vote           Cross-core vote (parallel phase): identical input on\n");
     printf("                       all cores, majority rules on compressed digests\n");
@@ -1150,6 +1202,7 @@ int main(int argc, char **argv) {
             if      (strcmp(argv[i], "zlib") == 0) algorithm = ALG_ZLIB;
             else if (strcmp(argv[i], "zstd") == 0) algorithm = ALG_ZSTD;
             else if (strcmp(argv[i], "lz4") == 0)  algorithm = ALG_LZ4;
+            else if (strcmp(argv[i], "memcpy") == 0) algorithm = ALG_MEMCPY;
             else if (strcmp(argv[i], "all") == 0)  algorithm = ALG_ALL;
             else { fprintf(stderr, "Unknown alg: %s\n", argv[i]); return 1; }
         } else if ((strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--mode") == 0) && i+1 < argc) {

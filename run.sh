@@ -44,6 +44,9 @@ Commands:
                 boost-clock/power-transition faults (default 200 iters)
   topology      Print logical CPU -> socket/physical core mapping
                 (reconcile with vendor/RMA core numbering)
+  memory [I] [MB]  Memory-path workout: verified saturated memcpy through
+                caches/IMC/DRAM (default 100 iters, 256MB blocks).
+                RAM cost ~3x block per core. Use blocks larger than L3.
 
   sequential    Sequential only (one core at a time, identifies bad core)
   parallel      Parallel only (all cores at once, finds errors under load)
@@ -91,6 +94,7 @@ case "${1:-help}" in
     iopath)   "$BIN" -m both -i "${2:-100}" -a all -I ;;
     burst)    "$BIN" -m both -i "${2:-200}" -a all -b 50 ;;
     topology) "$BIN" -T ;;
+    memory)   "$BIN" -m both -i "${2:-100}" -s "${3:-256}" -a memcpy ;;
     sequential) "$BIN" -m sequential -i 100 -a all -v ;;
     parallel) "$BIN" -m parallel -i 100 -a all -v ;;
     core)
